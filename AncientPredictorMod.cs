@@ -9,7 +9,6 @@ using MegaCrit.Sts2.Core.Modding;
 using MegaCrit.Sts2.Core.Nodes;
 using MegaCrit.Sts2.Core.Nodes.Screens.Map;
 using MegaCrit.Sts2.Core.Runs;
-using MegaCrit.Sts2.Core.Saves;
 using Logger = MegaCrit.Sts2.Core.Logging.Logger;
 
 namespace AncientPredictor;
@@ -158,41 +157,6 @@ public static class AncientPredictorMod
 // ==========================================================================
 // Harmony Patches
 // ==========================================================================
-
-/// <summary>
-/// Remove this mod from "gameplay relevant" mod list so it doesn't
-/// affect save files or make saves "modded".
-/// </summary>
-[HarmonyPatch(typeof(ModManager), nameof(ModManager.GetGameplayRelevantModNameList))]
-internal class ModManagerPatch
-{
-    private static void Postfix(ref List<string>? __result)
-    {
-        if (__result == null) return;
-        __result.RemoveAll(name => name.StartsWith("AncientPredictor"));
-        if (__result.Count == 0)
-            __result = null;
-    }
-}
-
-/// <summary>
-/// Ensure the profile directory doesn't get the "modded/" prefix for our mod.
-/// </summary>
-[HarmonyPatch(typeof(UserDataPathProvider))]
-internal class ProfileDirPatch
-{
-    [HarmonyPatch("GetProfileDir")]
-    [HarmonyPostfix]
-    private static void GetProfileDirPostfix(ref string __result)
-    {
-        if (__result.StartsWith("modded/"))
-        {
-            var text = __result;
-            var length = "modded/".Length;
-            __result = text.Substring(length, text.Length - length);
-        }
-    }
-}
 
 /// <summary>
 /// Hook into RunManager.CleanUp to remove the overlay when the run ends.
