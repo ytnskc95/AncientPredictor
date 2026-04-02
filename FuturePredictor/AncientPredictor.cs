@@ -30,7 +30,7 @@ public static class AncientPredictor
         int ActIndex,
         string ActId,
         string AncientId,
-        string AncientType,
+        string AncientDisplayName,
         List<AncientOptionResult> Options
     );
 
@@ -73,7 +73,7 @@ public static class AncientPredictor
     {
         var runState = player.RunState;
         if (actIndex < 0 || actIndex >= runState.Acts.Count)
-            return new AncientActResult(actIndex, "?", "?", "Error", 
+            return new AncientActResult(actIndex, "?", "?", "Error",
                 new List<AncientOptionResult> { new("?", $"Act index {actIndex} out of range") });
 
         var key = new CacheKey(runState.Rng.Seed, player.NetId, actIndex);
@@ -86,12 +86,12 @@ public static class AncientPredictor
             var ancient = act.Ancient;
             var rng = BuildAncientRng(player, ancient);
             var options = SimulateOptions(player, ancient, rng, actIndex);
-            
-            // Get localized ancient name
-            var ancientId = ancient.Id.ToString();
-            var ancientType = ancient.GetType().Name;
-            
-            var result = new AncientActResult(actIndex, act.Id.ToString(), ancientId, ancientType, options);
+
+            var ancientId = ancient.Id.Entry;
+            // Use the game's localization system to get the ancient's display name
+            var ancientDisplayName = ancient.Title.GetFormattedText();
+
+            var result = new AncientActResult(actIndex, act.Id.ToString(), ancientId, ancientDisplayName, options);
             _cache[key] = result;
             return result;
         }
@@ -118,6 +118,7 @@ public static class AncientPredictor
 
     // ------------------------------------------------------------------
     // Per-Ancient option simulation (mirrors game source code)
+    // Uses real RelicModel objects for correct RNG consumption and localization
     // ------------------------------------------------------------------
     private static List<AncientOptionResult> SimulateOptions(
         Player player, AncientEventModel ancient, Rng rng, int actIndex)
@@ -131,163 +132,259 @@ public static class AncientPredictor
             Tanx      => SimulateTanx(player, rng),
             Vakuu     => SimulateVakuu(rng),
             Darv      => SimulateDarv(player, rng, actIndex),
-            _         => new List<AncientOptionResult> { new("?", $"No simulator for {ancient.GetType().Name}") }
+            _         => new List<AncientOptionResult> { new("?", $"Unknown Ancient: {ancient.GetType().Name}") }
         };
     }
 
     // ======================== Orobas ========================
+    // Source code GenerateInitialOptions order:
+    //   1. rng.NextItem(otherChars)           — pick another character for SeaGlass
+    //   2. rng.NextFloat()                    — decide PrismaticGem (< 0.3333333f)
+    //   3. rng.NextItem(pool1, 4 items)       — pick from 3 base + 1 mixed
+    //   4. rng.NextItem(OptionPool2, 3 items) — pick pool2
+    //   5. rng.NextItem(OptionPool3, 1~2 items) — pick pool3 (conditional)
     private static List<AncientOptionResult> SimulateOrobas(Player player, Rng rng)
     {
         // 1. Pick another character (for SeaGlass)
         var otherChars = player.UnlockState.Characters
             .Where(c => c.Id != player.Character.Id)
             .ToList();
-        var seaGlassChar = rng.NextItem(otherChars) ?? player.Character;
+        _ = rng.NextItem(otherChars) ?? player.Character;
 
         // 2. PrismaticGem vs SeaGlass
-        var pool1 = new List<string> { "ElectricShrymp", "GlassEye", "SandCastle" };
-        string mixedItem;
+        var pool1 = new List<RelicModel>
+        {
+            ModelDb.Relic<ElectricShrymp>().ToMutable(),
+            ModelDb.Relic<GlassEye>().ToMutable(),
+            ModelDb.Relic<SandCastle>().ToMutable()
+        };
+        RelicModel mixedItem;
         if (rng.NextFloat() < 0.3333333f)
-            mixedItem = "PrismaticGem";
+            mixedItem = ModelDb.Relic<PrismaticGem>().ToMutable();
         else
-            mixedItem = $"SeaGlass ({seaGlassChar.Id.Entry})";
+            mixedItem = ModelDb.Relic<SeaGlass>().ToMutable();
         pool1.Add(mixedItem);
 
         // 3. Pick from pool1 (4 items)
         var slot1 = rng.NextItem(pool1)!;
 
         // 4. Pool2: AlchemicalCoffer / Driftwood / RadiantPearl
-        var pool2 = new List<string> { "AlchemicalCoffer", "Driftwood", "RadiantPearl" };
+        var pool2 = new List<RelicModel>
+        {
+            ModelDb.Relic<AlchemicalCoffer>().ToMutable(),
+            ModelDb.Relic<Driftwood>().ToMutable(),
+            ModelDb.Relic<RadiantPearl>().ToMutable()
+        };
         var slot2 = rng.NextItem(pool2)!;
 
         // 5. Pool3: conditional TouchOfOrobas / ArchaicTooth
-        var pool3 = BuildOrobasPool3(player);
+        var (pool3, pool3Notes) = BuildOrobasPool3(player);
+        if (pool3.Count == 0)
+        {
+            return new List<AncientOptionResult>
+            {
+                RelicToOption(slot1),
+                RelicToOption(slot2),
+                new AncientOptionResult("(locked)", "(locked)")
+            };
+        }
+
         var slot3 = rng.NextItem(pool3)!;
+        pool3Notes.TryGetValue(slot3.Id.Entry, out var note3);
 
         return new List<AncientOptionResult>
         {
-            MakeOption(slot1),
-            MakeOption(slot2),
-            MakeOption(slot3)
+            RelicToOption(slot1),
+            RelicToOption(slot2),
+            RelicToOption(slot3, note3)
         };
     }
 
-    private static List<string> BuildOrobasPool3(Player player)
+    private static (List<RelicModel> pool, Dictionary<string, string> notes) BuildOrobasPool3(Player player)
     {
-        var pool3 = new List<string>();
+        var pool = new List<RelicModel>();
+        var notes = new Dictionary<string, string>();
 
         // TouchOfOrobas: player has a Starter-rarity relic
         var starterRelic = player.Relics.FirstOrDefault(r => r.Rarity == RelicRarity.Starter);
         if (starterRelic != null)
-            pool3.Add($"TouchOfOrobas (transforms {starterRelic.Id.Entry})");
+        {
+            var touch = ModelDb.Relic<TouchOfOrobas>().ToMutable();
+            pool.Add(touch);
+            var starterName = starterRelic.Title.GetFormattedText();
+            notes["TouchOfOrobas"] = $"→ {starterName}";
+        }
 
         // ArchaicTooth: deck has a Transcendence starter card
         var transcendenceKeys = new HashSet<string> { "Bash", "Neutralize", "Unleash", "FallingStar", "Dualcast" };
         bool hasTranscendenceCard = player.Deck.Cards.Any(c => transcendenceKeys.Contains(c.Id.Entry));
         if (hasTranscendenceCard)
-            pool3.Add("ArchaicTooth");
+        {
+            var tooth = ModelDb.Relic<ArchaicTooth>().ToMutable();
+            pool.Add(tooth);
+        }
 
-        if (pool3.Count == 0)
-            pool3.Add("(locked - no valid options)");
-
-        return pool3;
+        return (pool, notes);
     }
 
     // ======================== Pael ========================
+    // Source code GenerateInitialOptions order:
+    //   1. rng.NextItem(OptionPool1, 3 items)
+    //   2. Build pool2: [PaelsWing] + conditional PaelsClaw/PaelsTooth → AddRange(self) → + PaelsGrowth
+    //      rng.NextItem(pool2)
+    //   3. Build pool3: [PaelsEye, PaelsBlood] + conditional PaelsLegion
+    //      rng.NextItem(pool3)
     private static List<AncientOptionResult> SimulatePael(Player player, Rng rng)
     {
         // Pool1
-        var pool1 = new List<string> { "PaelsFlesh", "PaelsHorn", "PaelsTears" };
+        var pool1 = new List<RelicModel>
+        {
+            ModelDb.Relic<PaelsFlesh>().ToMutable(),
+            ModelDb.Relic<PaelsHorn>().ToMutable(),
+            ModelDb.Relic<PaelsTears>().ToMutable()
+        };
         var slot1 = rng.NextItem(pool1)!;
 
         // Pool2
-        var pool2 = new List<string> { "PaelsWing" };
+        var pool2 = new List<RelicModel> { ModelDb.Relic<PaelsWing>().ToMutable() };
         var cards = player.Deck.Cards;
         bool hasGoopy = cards.Count(c => ModelDb.Enchantment<Goopy>().CanEnchant(c)) >= 3;
         bool hasRemovable5 = cards.Count(c => c.IsRemovable) >= 5;
-        if (hasGoopy) pool2.Add("PaelsClaw");
-        if (hasRemovable5) pool2.Add("PaelsTooth");
-        // Source code: list.AddRange(list) -- double the list, then add PaelsGrowth
+        if (hasGoopy) pool2.Add(ModelDb.Relic<PaelsClaw>().ToMutable());
+        if (hasRemovable5) pool2.Add(ModelDb.Relic<PaelsTooth>().ToMutable());
+        // Source: list.AddRange(list) — double the list, then add PaelsGrowth
         pool2.AddRange(pool2.ToList());
-        pool2.Add("PaelsGrowth");
+        pool2.Add(ModelDb.Relic<PaelsGrowth>().ToMutable());
         var slot2 = rng.NextItem(pool2)!;
 
         // Pool3
-        var pool3 = new List<string> { "PaelsEye", "PaelsBlood" };
+        var pool3 = new List<RelicModel>
+        {
+            ModelDb.Relic<PaelsEye>().ToMutable(),
+            ModelDb.Relic<PaelsBlood>().ToMutable()
+        };
         bool hasPet = player.HasEventPet();
-        if (!hasPet) pool3.Add("PaelsLegion");
+        if (!hasPet) pool3.Add(ModelDb.Relic<PaelsLegion>().ToMutable());
         var slot3 = rng.NextItem(pool3)!;
-
-        string note2 = $"[Goopy>=3:{hasGoopy}, Removable>=5:{hasRemovable5}]";
-        string note3 = hasPet ? "[has pet: PaelsLegion excluded]" : "[no pet: PaelsLegion included]";
 
         return new List<AncientOptionResult>
         {
-            MakeOption(slot1),
-            MakeOption(slot2, note2),
-            MakeOption(slot3, note3)
+            RelicToOption(slot1),
+            RelicToOption(slot2),
+            RelicToOption(slot3)
         };
     }
 
     // ======================== Tezcatara ========================
+    // Source: rng.NextItem x 3 pools, simplest
     private static List<AncientOptionResult> SimulateTezcatara(Rng rng)
     {
-        var pool1 = new List<string> { "NutritiousSoup", "VeryHotCocoa", "YummyCookie" };
-        var pool2 = new List<string> { "BiiigHug", "Storybook", "SealOfGold", "ToastyMittens" };
-        var pool3 = new List<string> { "GoldenCompass", "PumpkinCandle", "ToyBox" };
+        var pool1 = new List<RelicModel>
+        {
+            ModelDb.Relic<NutritiousSoup>().ToMutable(),
+            ModelDb.Relic<VeryHotCocoa>().ToMutable(),
+            ModelDb.Relic<YummyCookie>().ToMutable()
+        };
+        var pool2 = new List<RelicModel>
+        {
+            ModelDb.Relic<BiiigHug>().ToMutable(),
+            ModelDb.Relic<Storybook>().ToMutable(),
+            ModelDb.Relic<SealOfGold>().ToMutable(),
+            ModelDb.Relic<ToastyMittens>().ToMutable()
+        };
+        var pool3 = new List<RelicModel>
+        {
+            ModelDb.Relic<GoldenCompass>().ToMutable(),
+            ModelDb.Relic<PumpkinCandle>().ToMutable(),
+            ModelDb.Relic<ToyBox>().ToMutable()
+        };
         return new List<AncientOptionResult>
         {
-            MakeOption(rng.NextItem(pool1)!),
-            MakeOption(rng.NextItem(pool2)!),
-            MakeOption(rng.NextItem(pool3)!)
+            RelicToOption(rng.NextItem(pool1)!),
+            RelicToOption(rng.NextItem(pool2)!),
+            RelicToOption(rng.NextItem(pool3)!)
         };
     }
 
     // ======================== Nonupeipe ========================
+    // Source: base pool (9) + conditional BeautifulBracelet → UnstableShuffle → Take(3)
     private static List<AncientOptionResult> SimulateNonupeipe(Player player, Rng rng)
     {
-        var pool = new List<string>
+        var pool = new List<RelicModel>
         {
-            "BlessedAntler", "BrilliantScarf", "DelicateFrond",
-            "DiamondDiadem", "FurCoat", "Glitter",
-            "JewelryBox", "LoomingFruit", "SignetRing"
+            ModelDb.Relic<BlessedAntler>().ToMutable(),
+            ModelDb.Relic<BrilliantScarf>().ToMutable(),
+            ModelDb.Relic<DelicateFrond>().ToMutable(),
+            ModelDb.Relic<DiamondDiadem>().ToMutable(),
+            ModelDb.Relic<FurCoat>().ToMutable(),
+            ModelDb.Relic<Glitter>().ToMutable(),
+            ModelDb.Relic<JewelryBox>().ToMutable(),
+            ModelDb.Relic<LoomingFruit>().ToMutable(),
+            ModelDb.Relic<SignetRing>().ToMutable()
         };
+        // Condition: Swift enchantable cards >= 4
         int swiftCount = player.Deck.Cards.Count(c => ModelDb.Enchantment<Swift>().CanEnchant(c));
         bool canBracelet = swiftCount >= 4;
-        if (canBracelet) pool.Add("BeautifulBracelet");
+        if (canBracelet) pool.Add(ModelDb.Relic<BeautifulBracelet>().ToMutable());
 
         pool.UnstableShuffle(rng);
         var chosen = pool.Take(3).ToList();
 
-        return chosen.Select(r => MakeOption(r,
-            r == "BeautifulBracelet" ? $"[apex: Swift x{swiftCount}>=4]" : null)).ToList();
+        return chosen.Select(r => RelicToOption(r,
+            r.Id.Entry == "BeautifulBracelet" ? $"Swift x{swiftCount} >= 4" : null)).ToList();
     }
 
     // ======================== Tanx ========================
+    // Source: base pool (9) + conditional TriBoomerang → UnstableShuffle → Take(3)
     private static List<AncientOptionResult> SimulateTanx(Player player, Rng rng)
     {
-        var pool = new List<string>
+        var pool = new List<RelicModel>
         {
-            "Claws", "Crossbow", "IronClub", "MeatCleaver", "Sai",
-            "SpikedGauntlets", "TanxsWhistle", "ThrowingAxe", "WarHammer"
+            ModelDb.Relic<Claws>().ToMutable(),
+            ModelDb.Relic<Crossbow>().ToMutable(),
+            ModelDb.Relic<IronClub>().ToMutable(),
+            ModelDb.Relic<MeatCleaver>().ToMutable(),
+            ModelDb.Relic<Sai>().ToMutable(),
+            ModelDb.Relic<SpikedGauntlets>().ToMutable(),
+            ModelDb.Relic<TanxsWhistle>().ToMutable(),
+            ModelDb.Relic<ThrowingAxe>().ToMutable(),
+            ModelDb.Relic<WarHammer>().ToMutable()
         };
+        // Condition: Instinct enchantable cards >= 3
         int instinctCount = player.Deck.Cards.Count(c => ModelDb.Enchantment<Instinct>().CanEnchant(c));
         bool canApex = instinctCount >= 3;
-        if (canApex) pool.Add("TriBoomerang");
+        if (canApex) pool.Add(ModelDb.Relic<TriBoomerang>().ToMutable());
 
         pool.UnstableShuffle(rng);
         var chosen = pool.Take(3).ToList();
 
-        return chosen.Select(r => MakeOption(r,
-            r == "TriBoomerang" ? $"[apex: Instinct x{instinctCount}>=3]" : null)).ToList();
+        return chosen.Select(r => RelicToOption(r,
+            r.Id.Entry == "TriBoomerang" ? $"Instinct x{instinctCount} >= 3" : null)).ToList();
     }
 
     // ======================== Vakuu ========================
+    // Source: 3 pools each UnstableShuffle → pick [0]
     private static List<AncientOptionResult> SimulateVakuu(Rng rng)
     {
-        var pool1 = new List<string> { "BloodSoakedRose", "WhisperingEarring", "Fiddle" };
-        var pool2 = new List<string> { "PreservedFog", "SereTalon", "DistinguishedCape" };
-        var pool3 = new List<string> { "ChoicesParadox", "MusicBox", "LordsParasol", "JeweledMask" };
+        var pool1 = new List<RelicModel>
+        {
+            ModelDb.Relic<BloodSoakedRose>().ToMutable(),
+            ModelDb.Relic<WhisperingEarring>().ToMutable(),
+            ModelDb.Relic<Fiddle>().ToMutable()
+        };
+        var pool2 = new List<RelicModel>
+        {
+            ModelDb.Relic<PreservedFog>().ToMutable(),
+            ModelDb.Relic<SereTalon>().ToMutable(),
+            ModelDb.Relic<DistinguishedCape>().ToMutable()
+        };
+        var pool3 = new List<RelicModel>
+        {
+            ModelDb.Relic<ChoicesParadox>().ToMutable(),
+            ModelDb.Relic<MusicBox>().ToMutable(),
+            ModelDb.Relic<LordsParasol>().ToMutable(),
+            ModelDb.Relic<JeweledMask>().ToMutable()
+        };
 
         pool1.UnstableShuffle(rng);
         pool2.UnstableShuffle(rng);
@@ -295,33 +392,52 @@ public static class AncientPredictor
 
         return new List<AncientOptionResult>
         {
-            MakeOption(pool1[0]),
-            MakeOption(pool2[0]),
-            MakeOption(pool3[0])
+            RelicToOption(pool1[0]),
+            RelicToOption(pool2[0]),
+            RelicToOption(pool3[0])
         };
     }
 
     // ======================== Darv ========================
+    // Source _validRelicSets (static, 9 sets):
+    //   0: [Astrolabe]                          — always
+    //   1: [BlackStar]                          — always
+    //   2: [CallingBell]                        — always
+    //   3: [EmptyCage]                          — always
+    //   4: [PandorasBox]                        — filter: !Modifiers.Any(m => m.ClearsPlayerDeck)
+    //   5: [RunicPyramid]                       — always
+    //   6: [SneckoEye]                          — always
+    //   7: [Ectoplasm, Sozu]                    — filter: CurrentActIndex == 1
+    //   8: [PhilosophersStone, VelvetChoker]     — filter: CurrentActIndex == 2
+    //
+    // GenerateInitialOptions order:
+    //   1. For each passing filter set: rng.NextItem(set.relics) → collect to list
+    //   2. list.UnstableShuffle(rng)
+    //   3. rng.NextBool() → 50% DustyTome
+    //   4. If DustyTome: take first 2 + DustyTome; else take first 3
+    //
+    // [Fix] Uses actIndex parameter instead of player.RunState.CurrentActIndex
+    //       because prediction may run before the player reaches that act
     private static List<AncientOptionResult> SimulateDarv(Player player, Rng rng, int actIndex)
     {
-        // Build relic sets matching source code static Darv() order
-        var allSets = new List<(Func<bool> filter, List<string> relics, string? note)>
+        var allSets = new List<(Func<bool> filter, List<RelicModel> relics)>
         {
-            (() => true, new List<string> { "Astrolabe" }, null),
-            (() => true, new List<string> { "BlackStar" }, null),
-            (() => true, new List<string> { "CallingBell" }, null),
-            (() => true, new List<string> { "EmptyCage" }, null),
+            (() => true, new List<RelicModel> { ModelDb.Relic<Astrolabe>().ToMutable() }),
+            (() => true, new List<RelicModel> { ModelDb.Relic<BlackStar>().ToMutable() }),
+            (() => true, new List<RelicModel> { ModelDb.Relic<CallingBell>().ToMutable() }),
+            (() => true, new List<RelicModel> { ModelDb.Relic<EmptyCage>().ToMutable() }),
             (() => !player.RunState.Modifiers.Any(m => m.ClearsPlayerDeck),
-                new List<string> { "PandorasBox" }, "requires no ClearsPlayerDeck modifier"),
-            (() => true, new List<string> { "RunicPyramid" }, null),
-            (() => true, new List<string> { "SneckoEye" }, null),
-            // Use actIndex parameter instead of player.RunState.CurrentActIndex for forward prediction
-            (() => actIndex == 1, new List<string> { "Ectoplasm", "Sozu" }, "act2 only"),
-            (() => actIndex == 2, new List<string> { "PhilosophersStone", "VelvetChoker" }, "act3 only"),
+                new List<RelicModel> { ModelDb.Relic<PandorasBox>().ToMutable() }),
+            (() => true, new List<RelicModel> { ModelDb.Relic<RunicPyramid>().ToMutable() }),
+            (() => true, new List<RelicModel> { ModelDb.Relic<SneckoEye>().ToMutable() }),
+            (() => actIndex == 1,
+                new List<RelicModel> { ModelDb.Relic<Ectoplasm>().ToMutable(), ModelDb.Relic<Sozu>().ToMutable() }),
+            (() => actIndex == 2,
+                new List<RelicModel> { ModelDb.Relic<PhilosophersStone>().ToMutable(), ModelDb.Relic<VelvetChoker>().ToMutable() }),
         };
 
         // Source: (from rs in _validRelicSets where rs.filter(Owner) select ...).ToList()
-        var pickedRelics = new List<string>();
+        var pickedRelics = new List<RelicModel>();
         foreach (var set in allSets)
         {
             if (set.filter())
@@ -341,14 +457,14 @@ public static class AncientPredictor
         if (hasDustyTome)
         {
             result = pickedRelics.Take(2)
-                .Select(r => MakeOption(r))
+                .Select(r => RelicToOption(r))
                 .ToList();
-            result.Add(MakeOption("DustyTome", "50% branch"));
+            result.Add(RelicToOption(ModelDb.Relic<DustyTome>().ToMutable(), "50%"));
         }
         else
         {
             result = pickedRelics.Take(3)
-                .Select(r => MakeOption(r))
+                .Select(r => RelicToOption(r))
                 .ToList();
         }
 
@@ -356,14 +472,13 @@ public static class AncientPredictor
     }
 
     // ------------------------------------------------------------------
-    // Helper: Create an AncientOptionResult with localized name lookup
+    // Helper: Create an AncientOptionResult from a RelicModel
+    // Uses model.Title.GetFormattedText() for proper localization
     // ------------------------------------------------------------------
-    private static AncientOptionResult MakeOption(string relicName, string? note = null)
+    private static AncientOptionResult RelicToOption(RelicModel model, string? note = null)
     {
-        var relic = ModelDb.AllRelics
-            .FirstOrDefault(r => string.Equals(r.Id.Entry, relicName, StringComparison.OrdinalIgnoreCase));
-        var localizedName = relic?.Title?.GetFormattedText() ?? relicName;
-        return new AncientOptionResult(relicName, localizedName, note);
+        var localizedName = model.Title.GetFormattedText();
+        return new AncientOptionResult(model.Id.Entry, localizedName, note);
     }
 
     /// <summary>
