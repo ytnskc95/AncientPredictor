@@ -283,7 +283,7 @@ public partial class AncientOverlay : Control
     {
         // ── Act header ──
         var actHeader = new Label();
-        actHeader.Text = $"Act {act.ActIndex + 1} - {act.AncientType}";
+        actHeader.Text = $"Act {act.ActIndex + 1} - {act.AncientDisplayName}";
         actHeader.AddThemeColorOverride("font_color", TextGold);
         actHeader.AddThemeFontSizeOverride("font_size", 15);
         _contentContainer.AddChild(actHeader);
