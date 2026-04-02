@@ -1,0 +1,11 @@
+{
+  "id": "AncientPredictor",
+  "name": "AncientPredictor",
+  "author": "Luviagelita",
+  "description": "Displays Ancient predictions as an in-game floating overlay on the map screen. No more switching to browser!",
+  "version": "1.0.0",
+  "has_pck": true,
+  "has_dll": true,
+  "dependencies": [],
+  "affects_gameplay": false
+}
